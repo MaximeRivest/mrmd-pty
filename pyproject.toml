@@ -1,6 +1,6 @@
 [project]
 name = "mrmd-pty"
-version = "0.1.1"
+version = "0.1.2"
 description = "PTY WebSocket server for terminal blocks in MRMD"
 readme = "README.md"
 requires-python = ">=3.10"
