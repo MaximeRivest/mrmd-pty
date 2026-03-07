@@ -1,27 +1,22 @@
 """
 PTY WebSocket server for terminal blocks.
 
-Provides WebSocket endpoints that spawn PTY (pseudo-terminal) sessions
-and connect them to clients for full terminal emulation.
+Provides WebSocket endpoints that spawn terminal sessions and connect them to
+clients for full terminal emulation.
 
-Features:
-- Terminal metadata tracking (name, cwd, venv, file associations)
-- List/create/rename/kill terminal endpoints
-- Persistent sessions across client reconnects
-- Multiple clients can view the same terminal
-- Buffer replay on reconnect
+On POSIX this uses a real PTY via pty/fork.
+On Windows this uses ConPTY via pywinpty.
 """
 
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import json
 import os
-import pty
+import shlex
+import shutil
 import signal
 import struct
-import termios
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -32,6 +27,18 @@ from aiohttp import WSMsgType, web
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+IS_WINDOWS = os.name == "nt"
+
+if IS_WINDOWS:
+    try:
+        from winpty import PtyProcess  # type: ignore
+    except ImportError:  # pragma: no cover - depends on Windows env
+        PtyProcess = None  # type: ignore[assignment]
+else:  # POSIX
+    import fcntl
+    import pty
+    import termios
+
 
 @dataclass
 class TerminalMeta:
@@ -41,6 +48,7 @@ class TerminalMeta:
     name: str  # Display name
     cwd: str
     venv: str | None = None
+    shell: str | None = None
     created_at: datetime = field(default_factory=datetime.now)
     last_activity: datetime = field(default_factory=datetime.now)
     file_path: str | None = None  # Associated file (for notebook terminals)
@@ -51,6 +59,7 @@ class TerminalMeta:
             "name": self.name,
             "cwd": self.cwd,
             "venv": self.venv,
+            "shell": self.shell,
             "created_at": self.created_at.isoformat(),
             "last_activity": self.last_activity.isoformat(),
             "file_path": self.file_path,
@@ -58,64 +67,54 @@ class TerminalMeta:
 
 
 class PtySession:
-    """Manages a single PTY session with multiple client support."""
+    """Manages a single terminal session with multiple client support."""
 
-    # Size of output buffer to keep for reconnects (bytes)
     OUTPUT_BUFFER_SIZE = 65536  # 64KB
 
     def __init__(self, session_id: str):
-        # Multiple WebSocket connections can view the same terminal
         self.clients: list[web.WebSocketResponse] = []
         self.session_id = session_id
+        self.running = False
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._output_buffer = bytearray()
+        self._clients_lock = asyncio.Lock()
+
+        # POSIX state
         self.master_fd: int | None = None
         self.slave_fd: int | None = None
         self.pid: int | None = None
-        self.running = False
-        self._loop: asyncio.AbstractEventLoop | None = None
-        # Buffer to store recent output for replay on reconnect
-        self._output_buffer = bytearray()
-        # Lock for thread-safe client list modifications
-        self._clients_lock = asyncio.Lock()
+
+        # Windows state
+        self.proc: Any | None = None
+        self._reader_task: asyncio.Task | None = None
 
     async def start(
         self,
         shell: str | None = None,
         cwd: str | None = None,
         venv: str | None = None,
+        cols: int = 80,
+        rows: int = 24,
     ) -> None:
-        """Start the PTY session.
-
-        Args:
-            shell: Shell to use (default: $SHELL or /bin/bash)
-            cwd: Working directory (default: os.getcwd())
-            venv: Path to venv's python (e.g., /path/.venv/bin/python)
-                  Will activate the venv in the shell
-        """
-        if shell is None:
-            shell = os.environ.get("SHELL", "/bin/bash")
-
-        if cwd is None:
-            cwd = os.getcwd()
-
+        """Start the terminal session."""
         self._loop = asyncio.get_event_loop()
+        cwd = cwd or os.getcwd()
 
-        # Create PTY
+        if IS_WINDOWS:
+            await self._start_windows(shell=shell, cwd=cwd, venv=venv, cols=cols, rows=rows)
+        else:
+            await self._start_posix(shell=shell, cwd=cwd, venv=venv)
+
+    async def _start_posix(self, shell: str | None, cwd: str, venv: str | None) -> None:
+        shell = shell or os.environ.get("SHELL", "/bin/bash")
+
         self.master_fd, self.slave_fd = pty.openpty()
-
-        # Fork process
         self.pid = os.fork()
 
         if self.pid == 0:
-            # Child process
             os.close(self.master_fd)
-
-            # Create new session
             os.setsid()
-
-            # Set controlling terminal
             fcntl.ioctl(self.slave_fd, termios.TIOCSCTTY, 0)
-
-            # Redirect stdio
             os.dup2(self.slave_fd, 0)
             os.dup2(self.slave_fd, 1)
             os.dup2(self.slave_fd, 2)
@@ -123,82 +122,120 @@ class PtySession:
             if self.slave_fd > 2:
                 os.close(self.slave_fd)
 
-            # Change directory
             try:
                 os.chdir(cwd)
             except OSError:
                 pass
 
-            # Set environment
             env = os.environ.copy()
             env["TERM"] = "xterm-256color"
 
-            # Activate venv if provided
             if venv:
-                # venv is path to python like /path/.venv/bin/python
-                # Extract the venv root (remove /bin/python)
-                venv_bin = os.path.dirname(venv)  # /path/.venv/bin
-                venv_root = os.path.dirname(venv_bin)  # /path/.venv
-
+                venv_bin = os.path.dirname(venv)
+                venv_root = os.path.dirname(venv_bin)
                 if os.path.isdir(venv_bin):
-                    # Set VIRTUAL_ENV
                     env["VIRTUAL_ENV"] = venv_root
-                    # Prepend venv bin to PATH
                     env["PATH"] = venv_bin + ":" + env.get("PATH", "")
-                    # Unset PYTHONHOME if set
                     env.pop("PYTHONHOME", None)
 
-            # Execute shell
             os.execvpe(shell, [shell], env)
         else:
-            # Parent process
             os.close(self.slave_fd)
             self.slave_fd = None
             self.running = True
 
-            # Set non-blocking mode
             flags = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
             fcntl.fcntl(self.master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            self._loop.add_reader(self.master_fd, self._on_posix_read)
 
-            # Use asyncio to watch the file descriptor
-            self._loop.add_reader(self.master_fd, self._on_pty_read)
+    async def _start_windows(
+        self,
+        shell: str | None,
+        cwd: str,
+        venv: str | None,
+        cols: int,
+        rows: int,
+    ) -> None:
+        if PtyProcess is None:
+            raise RuntimeError("pywinpty is not installed")
 
-    def _on_pty_read(self) -> None:
-        """Called when PTY has data to read."""
+        argv, shell_name, shell_cwd = _resolve_windows_shell(shell, cwd)
+        env = os.environ.copy()
+        env.setdefault("TERM", "xterm-256color")
+
+        if venv:
+            venv_bin = os.path.dirname(venv)
+            venv_root = os.path.dirname(venv_bin)
+            if os.path.isdir(venv_bin):
+                env["VIRTUAL_ENV"] = venv_root
+                env["PATH"] = venv_bin + os.pathsep + env.get("PATH", "")
+                env.pop("PYTHONHOME", None)
+
+        self.proc = PtyProcess.spawn(
+            argv,
+            cwd=shell_cwd,
+            env=env,
+            dimensions=(rows, cols),
+        )
+        self.running = True
+        self._reader_task = asyncio.create_task(self._windows_read_loop())
+        print(f"[PTY] Windows terminal started: {shell_name}")
+
+    async def _windows_read_loop(self) -> None:
+        while self.running and self.proc is not None:
+            try:
+                chunk = await asyncio.to_thread(self.proc.read, 65536)
+            except EOFError:
+                break
+            except OSError as e:
+                print(f"[PTY] Windows read error: {e}")
+                break
+            except Exception as e:
+                print(f"[PTY] Windows terminal exited: {e}")
+                break
+
+            if not chunk:
+                await asyncio.sleep(0.01)
+                continue
+
+            text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="replace")
+            self._append_output(text)
+            await self._send_to_ws(text)
+
+        self._cleanup()
+
+    def _append_output(self, text: str) -> None:
+        data = text.encode("utf-8", errors="replace")
+        self._output_buffer.extend(data)
+        if len(self._output_buffer) > self.OUTPUT_BUFFER_SIZE:
+            self._output_buffer = self._output_buffer[-self.OUTPUT_BUFFER_SIZE :]
+
+    def _on_posix_read(self) -> None:
         if not self.running or self.master_fd is None:
             return
 
         try:
             data = os.read(self.master_fd, 65536)
             if data:
-                # Store in output buffer for reconnect replay
-                self._output_buffer.extend(data)
-                # Keep buffer at max size
-                if len(self._output_buffer) > self.OUTPUT_BUFFER_SIZE:
-                    self._output_buffer = self._output_buffer[-self.OUTPUT_BUFFER_SIZE :]
-                # Schedule sending to websocket
-                asyncio.create_task(self._send_to_ws(data))
+                text = data.decode("utf-8", errors="replace")
+                self._append_output(text)
+                asyncio.create_task(self._send_to_ws(text))
             else:
-                # EOF - process exited
                 self._cleanup()
         except BlockingIOError:
-            # No data available yet
             pass
         except OSError as e:
-            if e.errno == 5:  # Input/output error - PTY closed
+            if getattr(e, "errno", None) == 5:
                 self._cleanup()
             else:
                 print(f"[PTY] Read error: {e}")
                 self._cleanup()
 
-    async def _send_to_ws(self, data: bytes) -> None:
-        """Send data to all connected WebSocket clients."""
+    async def _send_to_ws(self, text: str) -> None:
         if not self.clients:
             return
 
-        text = data.decode("utf-8", errors="replace")
         disconnected = []
-
         async with self._clients_lock:
             for ws in self.clients:
                 try:
@@ -208,13 +245,11 @@ class PtySession:
                     print(f"[PTY] WebSocket send error: {e}")
                     disconnected.append(ws)
 
-            # Remove disconnected clients
             for ws in disconnected:
                 if ws in self.clients:
                     self.clients.remove(ws)
 
     async def replay_buffer(self, ws: web.WebSocketResponse) -> None:
-        """Replay the output buffer to a specific client."""
         if self._output_buffer:
             try:
                 await ws.send_str(self._output_buffer.decode("utf-8", errors="replace"))
@@ -222,61 +257,76 @@ class PtySession:
                 print(f"[PTY] Buffer replay error: {e}")
 
     async def add_client(self, ws: web.WebSocketResponse) -> None:
-        """Add a client to this terminal session."""
         async with self._clients_lock:
             if ws not in self.clients:
                 self.clients.append(ws)
-                print(
-                    f"[PTY] Client added to {self.session_id}, "
-                    f"total clients: {len(self.clients)}"
-                )
+                print(f"[PTY] Client added to {self.session_id}, total clients: {len(self.clients)}")
 
     async def remove_client(self, ws: web.WebSocketResponse) -> None:
-        """Remove a client from this terminal session."""
         async with self._clients_lock:
             if ws in self.clients:
                 self.clients.remove(ws)
                 print(
-                    f"[PTY] Client removed from {self.session_id}, "
-                    f"remaining clients: {len(self.clients)}"
+                    f"[PTY] Client removed from {self.session_id}, remaining clients: {len(self.clients)}"
                 )
 
     def _cleanup(self) -> None:
-        """Clean up resources."""
         self.running = False
-        if self._loop and self.master_fd is not None:
+        if not IS_WINDOWS and self._loop and self.master_fd is not None:
             try:
                 self._loop.remove_reader(self.master_fd)
             except Exception:
                 pass
 
     def write(self, data: str) -> None:
-        """Write data to PTY."""
-        if self.master_fd is not None and self.running:
-            try:
+        if not self.running:
+            return
+
+        try:
+            if IS_WINDOWS and self.proc is not None:
+                self.proc.write(data)
+            elif self.master_fd is not None:
                 os.write(self.master_fd, data.encode("utf-8"))
-            except OSError as e:
-                print(f"[PTY] Write error: {e}")
+        except OSError as e:
+            print(f"[PTY] Write error: {e}")
+        except Exception as e:
+            print(f"[PTY] Write error: {e}")
 
     def resize(self, cols: int, rows: int) -> None:
-        """Resize the PTY."""
-        if self.master_fd is not None:
-            try:
+        try:
+            if IS_WINDOWS and self.proc is not None:
+                self.proc.setwinsize(rows, cols)
+            elif self.master_fd is not None:
                 winsize = struct.pack("HHHH", rows, cols, 0, 0)
                 fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
-            except OSError as e:
-                print(f"[PTY] Resize error: {e}")
+        except OSError as e:
+            print(f"[PTY] Resize error: {e}")
+        except Exception as e:
+            print(f"[PTY] Resize error: {e}")
 
     def stop(self) -> None:
-        """Stop the PTY session."""
         self._cleanup()
+
+        if IS_WINDOWS:
+            if self._reader_task:
+                self._reader_task.cancel()
+                self._reader_task = None
+            if self.proc is not None:
+                try:
+                    self.proc.terminate(force=True)
+                except Exception:
+                    try:
+                        self.proc.close(force=True)
+                    except Exception:
+                        pass
+                self.proc = None
+            return
 
         if self.pid:
             try:
                 os.kill(self.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            # Schedule force kill
             if self._loop:
                 self._loop.call_later(0.5, self._force_kill)
 
@@ -288,45 +338,78 @@ class PtySession:
             self.master_fd = None
 
     def _force_kill(self) -> None:
-        """Force kill the process if still running."""
-        if self.pid:
-            try:
-                os.kill(self.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(self.pid, os.WNOHANG)
-            except Exception:
-                pass
+        if not self.pid:
+            return
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+        try:
+            os.waitpid(self.pid, os.WNOHANG)
+        except Exception:
+            pass
 
 
 # ==================== Terminal Registry ====================
 
-# Store active PTY sessions by session_id (persistent across reconnects)
 _pty_sessions: dict[str, PtySession] = {}
-
-# Store terminal metadata
 _terminal_meta: dict[str, TerminalMeta] = {}
 
 
 def _generate_terminal_name() -> str:
-    """Generate a unique terminal name based on existing terminals."""
     existing_names = {meta.name for meta in _terminal_meta.values()}
-
-    # First terminal is "main"
     if "main" not in existing_names:
         return "main"
-
-    # Find next available number
     i = 2
     while f"term-{i}" in existing_names:
         i += 1
     return f"term-{i}"
 
 
+def _windows_to_wsl_path(windows_path: str | None) -> str | None:
+    if not windows_path:
+        return None
+    norm = windows_path.replace("\\", "/")
+    if len(norm) >= 3 and norm[1:3] == ":/":
+        drive = norm[0].lower()
+        rest = norm[3:]
+        return f"/mnt/{drive}/{rest}".rstrip("/") or "/"
+    return None
+
+
+def _resolve_windows_shell(shell: str | None, cwd: str | None) -> tuple[list[str], str, str | None]:
+    requested = (shell or os.environ.get("MRMD_PTY_SHELL") or "powershell").strip()
+    lower = requested.lower()
+
+    def which(exe: str) -> str | None:
+        return shutil.which(exe)
+
+    if lower in {"auto", "default", "powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+        if which("pwsh.exe"):
+            return (["pwsh.exe", "-NoLogo"], "pwsh", cwd)
+        if which("powershell.exe"):
+            return (["powershell.exe", "-NoLogo"], "powershell", cwd)
+        return (["cmd.exe"], "cmd", cwd)
+
+    if lower in {"cmd", "cmd.exe"}:
+        return (["cmd.exe"], "cmd", cwd)
+
+    if lower in {"wsl", "wsl.exe"}:
+        argv = ["wsl.exe"]
+        wsl_cwd = _windows_to_wsl_path(cwd)
+        if wsl_cwd:
+            argv += ["--cd", wsl_cwd]
+        return (argv, "wsl", None)
+
+    argv = shlex.split(requested, posix=False)
+    if not argv:
+        return (["powershell.exe", "-NoLogo"], "powershell", cwd)
+    return (argv, argv[0], cwd)
+
+
 def get_terminal_list() -> list[TerminalMeta]:
-    """Get list of all terminal sessions with metadata."""
-    # Clean up stale metadata (no matching session or session not running)
     stale_ids = []
     for session_id in _terminal_meta:
         session = _pty_sessions.get(session_id)
@@ -342,19 +425,16 @@ def get_terminal_list() -> list[TerminalMeta]:
 
 
 def get_terminal_meta(session_id: str) -> TerminalMeta | None:
-    """Get metadata for a specific terminal."""
     return _terminal_meta.get(session_id)
 
 
 def update_terminal_activity(session_id: str) -> None:
-    """Update last activity timestamp for a terminal."""
     meta = _terminal_meta.get(session_id)
     if meta:
         meta.last_activity = datetime.now()
 
 
 def rename_terminal(session_id: str, new_name: str) -> bool:
-    """Rename a terminal session."""
     meta = _terminal_meta.get(session_id)
     if meta:
         meta.name = new_name
@@ -362,51 +442,42 @@ def rename_terminal(session_id: str, new_name: str) -> bool:
     return False
 
 
-# ==================== WebSocket Handler ====================
-
-
 async def handle_pty_websocket(request: web.Request) -> web.WebSocketResponse:
-    """WebSocket handler for PTY connections.
-
-    Supports multiple clients viewing the same terminal session.
-    """
+    """WebSocket handler for PTY connections."""
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
-    # Get parameters from query
     session_id = request.query.get("session_id", "default")
     cwd = request.query.get("cwd")
     venv = request.query.get("venv")
+    shell = request.query.get("shell")
     name = request.query.get("name")
     file_path = request.query.get("file_path")
 
-    print(f"[PTY] WebSocket connection for session {session_id}, cwd={cwd}, venv={venv}")
+    print(
+        f"[PTY] WebSocket connection for session {session_id}, "
+        f"cwd={cwd}, venv={venv}, shell={shell}"
+    )
 
-    # Check if we have an existing session to connect to
     session = _pty_sessions.get(session_id)
 
     if session and session.running:
-        # Connect to existing session (could be reconnect or additional client)
         print(f"[PTY] Joining existing session {session_id}")
         await session.add_client(ws)
 
-        # Re-add the reader if needed (in case all clients had disconnected)
-        if session.master_fd is not None and session._loop:
+        if not IS_WINDOWS and session.master_fd is not None and session._loop:
             try:
-                session._loop.add_reader(session.master_fd, session._on_pty_read)
+                session._loop.add_reader(session.master_fd, session._on_posix_read)
             except Exception:
                 pass
 
-        # Replay buffered output so client sees previous state
         await session.replay_buffer(ws)
         update_terminal_activity(session_id)
     else:
-        # Create new PTY session
         session = PtySession(session_id)
         await session.add_client(ws)
         _pty_sessions[session_id] = session
 
-        # Create metadata if not exists
         if session_id not in _terminal_meta:
             effective_cwd = cwd or os.getcwd()
             meta = TerminalMeta(
@@ -414,23 +485,24 @@ async def handle_pty_websocket(request: web.Request) -> web.WebSocketResponse:
                 name=name or _generate_terminal_name(),
                 cwd=effective_cwd,
                 venv=venv,
+                shell=shell,
                 file_path=file_path,
             )
             _terminal_meta[session_id] = meta
 
         try:
-            # Start PTY with project cwd and venv
-            await session.start(cwd=cwd, venv=venv)
+            await session.start(shell=shell, cwd=cwd, venv=venv)
         except Exception as e:
             print(f"[PTY] Failed to start session: {e}")
+            await ws.send_str(f"[PTY] Failed to start terminal: {e}\r\n")
             await session.remove_client(ws)
             del _pty_sessions[session_id]
             if session_id in _terminal_meta:
                 del _terminal_meta[session_id]
+            await ws.close()
             return ws
 
     try:
-        # Handle incoming messages from this client
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
                 try:
@@ -438,31 +510,25 @@ async def handle_pty_websocket(request: web.Request) -> web.WebSocketResponse:
                     msg_type = data.get("type")
 
                     if msg_type == "input":
-                        # User input -> PTY (any client can send input)
                         session.write(data.get("data", ""))
                         update_terminal_activity(session_id)
                     elif msg_type == "resize":
-                        # Resize terminal (last resize wins)
                         cols = data.get("cols", 80)
                         rows = data.get("rows", 24)
                         session.resize(cols, rows)
                 except json.JSONDecodeError:
-                    # Raw text input
                     session.write(msg.data)
                     update_terminal_activity(session_id)
 
             elif msg.type == WSMsgType.ERROR:
                 print(f"[PTY] WebSocket error: {ws.exception()}")
                 break
-
     except Exception as e:
         print(f"[PTY] Error: {e}")
     finally:
-        # Remove this client from the session
         await session.remove_client(ws)
 
-        # If no clients left, keep PTY running but remove reader
-        if not session.clients and session._loop and session.master_fd is not None:
+        if not IS_WINDOWS and not session.clients and session._loop and session.master_fd is not None:
             try:
                 session._loop.remove_reader(session.master_fd)
             except Exception:
@@ -470,42 +536,30 @@ async def handle_pty_websocket(request: web.Request) -> web.WebSocketResponse:
 
         print(
             f"[PTY] WebSocket disconnected for session {session_id} "
-            f"(PTY still running, {len(session.clients)} clients remaining)"
+            f"({len(session.clients)} clients remaining)"
         )
 
     return ws
 
 
-# ==================== HTTP Handlers ====================
-
-
 async def handle_terminals_list(request: web.Request) -> web.Response:
-    """List all terminal sessions."""
     terminals = get_terminal_list()
     return web.json_response({"terminals": [t.to_dict() for t in terminals]})
 
 
 async def handle_terminals_create(request: web.Request) -> web.Response:
-    """Create a new terminal session (pre-allocate metadata).
-
-    This creates the metadata entry before the WebSocket connection.
-    The client should then connect to /api/pty?session_id=<returned_id>
-
-    Body: { name?, cwd?, venv?, file_path? }
-    Response: { session_id, name, ... }
-    """
     try:
         data = await request.json()
     except Exception:
         data = {}
 
     session_id = str(uuid.uuid4())[:8]
-
     meta = TerminalMeta(
         session_id=session_id,
         name=data.get("name") or _generate_terminal_name(),
         cwd=data.get("cwd") or os.getcwd(),
         venv=data.get("venv"),
+        shell=data.get("shell"),
         file_path=data.get("file_path"),
     )
     _terminal_meta[session_id] = meta
@@ -514,10 +568,6 @@ async def handle_terminals_create(request: web.Request) -> web.Response:
 
 
 async def handle_terminals_rename(request: web.Request) -> web.Response:
-    """Rename a terminal session.
-
-    Body: { session_id, name }
-    """
     try:
         data = await request.json()
         session_id = data.get("session_id")
@@ -528,15 +578,12 @@ async def handle_terminals_rename(request: web.Request) -> web.Response:
 
         if rename_terminal(session_id, new_name):
             return web.json_response({"success": True})
-        else:
-            return web.json_response({"error": "Terminal not found"}, status=404)
-
+        return web.json_response({"error": "Terminal not found"}, status=404)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
 
 async def handle_pty_kill(request: web.Request) -> web.Response:
-    """Kill a specific PTY session."""
     data = await request.json()
     session_id = data.get("session_id")
 
@@ -544,13 +591,11 @@ async def handle_pty_kill(request: web.Request) -> web.Response:
         session = _pty_sessions[session_id]
         session.stop()
         del _pty_sessions[session_id]
-        # Also remove metadata
         if session_id in _terminal_meta:
             del _terminal_meta[session_id]
         print(f"[PTY] Killed session {session_id}")
         return web.json_response({"status": "ok"})
 
-    # Check if we have metadata but no session (pre-allocated but not connected)
     if session_id and session_id in _terminal_meta:
         del _terminal_meta[session_id]
         return web.json_response({"status": "ok"})
@@ -559,10 +604,6 @@ async def handle_pty_kill(request: web.Request) -> web.Response:
 
 
 async def handle_terminals_kill_for_file(request: web.Request) -> web.Response:
-    """Kill all terminal sessions associated with a file.
-
-    Body: { file_path }
-    """
     try:
         data = await request.json()
         file_path = data.get("file_path")
@@ -582,16 +623,13 @@ async def handle_terminals_kill_for_file(request: web.Request) -> web.Response:
                 print(f"[PTY] Killed session {session_id} (file closed: {file_path})")
 
         return web.json_response({"killed": killed})
-
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
 
 def setup_pty_routes(app: web.Application) -> None:
-    """Setup PTY WebSocket routes."""
     app.router.add_get("/api/pty", handle_pty_websocket)
     app.router.add_post("/api/pty/kill", handle_pty_kill)
-    # Terminal management endpoints
     app.router.add_get("/api/terminals", handle_terminals_list)
     app.router.add_post("/api/terminals", handle_terminals_create)
     app.router.add_post("/api/terminals/rename", handle_terminals_rename)
@@ -599,7 +637,6 @@ def setup_pty_routes(app: web.Application) -> None:
 
 
 def create_app() -> web.Application:
-    """Create and configure the aiohttp application."""
     app = web.Application()
     setup_pty_routes(app)
     return app

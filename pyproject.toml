@@ -13,6 +13,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -22,6 +23,7 @@ classifiers = [
 
 dependencies = [
     "aiohttp>=3.8.0",
+    "pywinpty>=2.0.15; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]
